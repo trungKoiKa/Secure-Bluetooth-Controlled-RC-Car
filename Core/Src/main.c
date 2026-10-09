@@ -23,6 +23,7 @@
 /* USER CODE BEGIN Includes */
 #include "Car.h"
 #include "Keypad.h"
+#include "Lcd.h"
 #include "string.h"
 /* USER CODE END Includes */
 
@@ -78,53 +79,85 @@ typedef enum
 KeypadState keypad_state = LOCK_STATE;
 
 #define PASSWORD_LEN 8
+#define MAX_PASS_ERR 3
+#define LOCK_TIME_MS 30000
 uint8_t pass[PASSWORD_LEN] = "01234567";
 uint8_t count_err;
 uint32_t timer_start_err;
 
 typedef struct
 {
-	uint8_t buff[PASSWORD_LEN];
+	uint8_t buff[PASSWORD_LEN + 1]; // +1 de luon co '\0'
 	uint8_t index;
 }Password_Typedef;
 
 Password_Typedef password;
 
+// ---------------Trang thai xe + failsafe----------
+// Mat lenh di chuyen qua CMD_TIMEOUT_MS thi xe tu dung (dat 0 de tat failsafe)
+#define CMD_TIMEOUT_MS 500
+
+Car_State car_state = CAR_STOP_STATE;
+uint8_t car_speed = 100;
+uint32_t last_cmd_tick;
+
+static void car_move(Car_State state, uint8_t speed)
+{
+	car_control(state, speed);
+	car_state = state;
+	last_cmd_tick = HAL_GetTick();
+}
+
+static void car_halt(void)
+{
+	car_control(CAR_STOP_STATE, 0);
+	car_state = CAR_STOP_STATE;
+}
+
+static void password_reset(void)
+{
+	memset(&password, 0, sizeof(password));
+}
+
+void failsafe_handle(void)
+{
+#if CMD_TIMEOUT_MS > 0
+	if(car_state != CAR_STOP_STATE && HAL_GetTick() - last_cmd_tick > CMD_TIMEOUT_MS)
+	{
+		car_halt();
+	}
+#endif
+}
 
 void KeypadPressingCallback(uint8_t key)
 {
 	switch(keypad_state)
 	{
-		case NORMAL_STATE:
-			break;
-		case LOCK_STATE:
-			break;
 		case ENTER_PASS_STATE:
 		{
 			if(key >= '0' && key <= '9')
 			{
-				if(password.index < 8)
+				if(password.index < PASSWORD_LEN)
 				{
 					password.buff[password.index++] = key;
 				}
 			}
 			else if(key == 'D')
 			{
-				//check pass
-				if(strcmp((char *)password.buff, (char *)pass) == 0)
+				//check pass: phai du PASSWORD_LEN ky tu
+				if(password.index == PASSWORD_LEN
+					&& memcmp(password.buff, pass, PASSWORD_LEN) == 0)
 				{
 					//mat khau dung
+					count_err = 0;
+					password_reset();
 					keypad_state = NORMAL_STATE;
 				}
 				else
 				{
 					count_err++;
-					if(count_err < 3)
-					{
-						memset(&password.buff, 0, PASSWORD_LEN);
-						password.index = 0;
-					}
-					else
+					password_reset();
+					if(count_err >= MAX_PASS_ERR)
 					{
 						timer_start_err = HAL_GetTick();
 						keypad_state = LOCK_30s_STATE;
@@ -132,17 +165,28 @@ void KeypadPressingCallback(uint8_t key)
 				}
 			}
 			break;
-			default:
-				
-				break;
 		}
+		default:
+			break;
 	}
 }
+
 void KeypadPressingTimeOutCallback(uint8_t key)
 {
-	if(key == 'D')
+	if(key != 'D')
 	{
+		return;
+	}
+	if(keypad_state == LOCK_STATE)
+	{
+		password_reset();
 		keypad_state = ENTER_PASS_STATE;
+	}
+	else if(keypad_state == NORMAL_STATE)
+	{
+		// giu D khi dang dieu khien: khoa lai va dung xe
+		car_halt();
+		keypad_state = LOCK_STATE;
 	}
 }
 
@@ -150,16 +194,14 @@ void handle_state_keyboard()
 {
 	switch(keypad_state)
 	{
-		case NORMAL_STATE:
-			break;
-		case LOCK_STATE:
-			break;
 		case LOCK_30s_STATE:
 		{
-			if(HAL_GetTick() - timer_start_err >= 30000)
+			if(HAL_GetTick() - timer_start_err >= LOCK_TIME_MS)
 			{
+				count_err = 0;
 				keypad_state = LOCK_STATE;
 			}
+			break;
 		}
 		default:
 			break;
@@ -168,59 +210,158 @@ void handle_state_keyboard()
 
 
 //---------------Xu ly UART---------------------
+// Ring buffer: ngat UART ghi vao head, vong lap chinh doc tu tail
+#define RX_BUF_SIZE 32
 uint8_t data_rx;
-uint8_t uart_flag = 0;
-uint8_t car_speed = 100;
+static volatile uint8_t rx_buf[RX_BUF_SIZE];
+static volatile uint8_t rx_head;
+static volatile uint8_t rx_tail;
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
 	if(huart->Instance == huart1.Instance)
 	{
-		uart_flag = 1;
+		uint8_t next = (rx_head + 1) % RX_BUF_SIZE;
+		if(next != rx_tail) // day thi bo byte moi
+		{
+			rx_buf[rx_head] = data_rx;
+			rx_head = next;
+		}
 		HAL_UART_Receive_IT(&huart1, &data_rx, 1);
 	}
 }
 
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+	if(huart->Instance == huart1.Instance)
+	{
+		// loi overrun/framing/noise: xoa co va nhan lai, tranh treo UART
+		__HAL_UART_CLEAR_OREFLAG(&huart1);
+		HAL_UART_Receive_IT(&huart1, &data_rx, 1);
+	}
+}
 
+static void uart_process(uint8_t cmd)
+{
+	// Lenh dung luon co hieu luc o moi trang thai
+	if(cmd == 'S')
+	{
+		car_halt();
+		return;
+	}
+	if(keypad_state != NORMAL_STATE)
+	{
+		return;
+	}
+	switch(cmd)
+	{
+		case 'F':
+			car_move(CAR_FORWARD_STATE, car_speed);
+			break;
+		case 'B':
+			car_move(CAR_BACKWARD_STATE, car_speed);
+			break;
+		case 'L':
+			car_move(CAR_TURNLEFT_STATE, car_speed);
+			break;
+		case 'R':
+			car_move(CAR_TURNRIGHT_STATE, car_speed);
+			break;
+		default:
+			if(cmd >= '0' && cmd <= '9')
+			{
+				//0 -> 90
+				car_speed = (cmd - '0') * 10;
+			}
+			else if(cmd == 'q')
+			{
+				car_speed = 100;
+			}
+			break;
+	}
+}
 
 void uart_handle()
 {
-	if(keypad_state == NORMAL_STATE)
+	while(rx_tail != rx_head)
 	{
-		if(uart_flag)
+		uint8_t cmd = rx_buf[rx_tail];
+		rx_tail = (rx_tail + 1) % RX_BUF_SIZE;
+		uart_process(cmd);
+	}
+}
+//---------------Hien thi LCD---------------------
+#define LCD_ADDR (0x27 << 1) // PCF8574A: 0x3F << 1
+#define LCD_REFRESH_MS 100
+
+static char lcd_last[LCD_ROWS][LCD_COLS + 1];
+
+static void lcd_show(uint8_t row, const char *s)
+{
+	if(strcmp(lcd_last[row], s) != 0) // chi ve lai khi noi dung doi
+	{
+		lcd_print_line(row, s);
+		strncpy(lcd_last[row], s, LCD_COLS);
+		lcd_last[row][LCD_COLS] = 0;
+	}
+}
+
+// ghi so 0..999 vao dst, tra ve con tro sau so
+static char *put_num(char *dst, uint16_t v)
+{
+	if(v >= 100) *dst++ = '0' + v / 100;
+	if(v >= 10) *dst++ = '0' + (v / 10) % 10;
+	*dst++ = '0' + v % 10;
+	return dst;
+}
+
+void lcd_update(void)
+{
+	static uint32_t t_last;
+	if(HAL_GetTick() - t_last < LCD_REFRESH_MS)
+	{
+		return;
+	}
+	t_last = HAL_GetTick();
+
+	char l1[LCD_COLS + 1] = "";
+	char l2[LCD_COLS + 1] = "";
+	switch(keypad_state)
+	{
+		case LOCK_STATE:
+			strcpy(l1, "LOCKED");
+			strcpy(l2, "Hold D 3s unlock");
+			break;
+		case ENTER_PASS_STATE:
+			strcpy(l1, "ENTER PASSWORD");
+			memset(l2, '*', password.index);
+			l2[password.index] = 0;
+			break;
+		case LOCK_30s_STATE:
 		{
-			switch(data_rx)
-			{
-				case 'S':
-					car_control(CAR_STOP_STATE, 0);
-					break;
-				case 'F':
-					car_control(CAR_FORWARD_STATE, car_speed);
-					break;
-				case 'B':
-					car_control(CAR_BACKWARD_STATE, car_speed);
-					break;
-				case 'L':
-					car_control(CAR_TURNLEFT_STATE, car_speed);
-					break;
-				case 'R':
-					car_control(CAR_TURNRIGHT_STATE, car_speed);
-					break;
-				default:
-					if(data_rx >= '0' && data_rx <= '9')
-					{
-						//0 -> 90
-						car_speed = (data_rx - '0') * 10;
-					}
-					else if(data_rx == 'q')
-					{
-						car_speed = 100;
-					}
-					break;
-			}
-			uart_flag = 0;
+			uint32_t left = LOCK_TIME_MS - (HAL_GetTick() - timer_start_err);
+			if(left > LOCK_TIME_MS) left = 0; // tranh tran so khi het gio
+			strcpy(l1, "WRONG! LOCKED");
+			char *p = l2;
+			strcpy(p, "Wait: "); p += 6;
+			p = put_num(p, (left + 999) / 1000);
+			*p++ = 's'; *p = 0;
+			break;
+		}
+		case NORMAL_STATE:
+		{
+			static const char *dir_name[] = {"STOP", "FWD", "BACK", "LEFT", "RIGHT"};
+			strcpy(l1, "READY");
+			char *p = l2;
+			strcpy(p, dir_name[car_state]); p += strlen(dir_name[car_state]);
+			strcpy(p, " SPD:"); p += 5;
+			p = put_num(p, car_speed);
+			*p++ = '%'; *p = 0;
+			break;
 		}
 	}
+	lcd_show(0, l1);
+	lcd_show(1, l2);
 }
 /* USER CODE END 0 */
 
@@ -259,9 +400,9 @@ int main(void)
   /* USER CODE BEGIN 2 */
 	
 	car_init(&htim1);
-	car_control(CAR_FORWARD_STATE, 50);
 	HAL_UART_Receive_IT(&huart1, &data_rx, 1);
 	Keypad_Init();
+	lcd_init(&hi2c1, LCD_ADDR);
 //	control_motor1(MOTOR_CW, 50);
 //	control_motor2(MOTOR_CCW, 50);
   /* USER CODE END 2 */
@@ -276,6 +417,8 @@ int main(void)
 		uart_handle();
 		Keypad_Handle();
 		handle_state_keyboard();
+		failsafe_handle();
+		lcd_update();
 	}
   /* USER CODE END 3 */
 }

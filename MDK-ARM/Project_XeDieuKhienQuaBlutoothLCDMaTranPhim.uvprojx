@@ -625,6 +625,11 @@
               <FileType>1</FileType>
               <FilePath>..\myLib\Keypad.c</FilePath>
             </File>
+            <File>
+              <FileName>Lcd.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\myLib\Lcd.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>
